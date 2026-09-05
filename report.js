@@ -2,7 +2,7 @@
  * Daily Attendance Report — Exact Working Hours
  * =============================================
  * Emails each reporting manager the exact working hours of their reportees for
- * the previous day, as Excel + PDF attachments.
+ * the previous day, as a PDF attachment.
  *
  *   node report.js                 # live run
  *   DRY_RUN=true node report.js    # build files, send no email
@@ -68,7 +68,7 @@
  *        ZOHOPEOPLE.forms.READ       -> employee + reporting manager data
  *        ZOHOPEOPLE.attendance.READ  -> attendance entries
  *      Each needs its own Client ID, Secret and refresh token.
- *   2. npm install axios exceljs pdfkit nodemailer dotenv
+ *   2. npm install axios pdfkit nodemailer dotenv
  *   3. Create .env (never commit it):
  *
  *        ZOHO_FORMS_CLIENT_ID=...
@@ -90,14 +90,13 @@
  *      For Microsoft Graph instead (no password held anywhere):
  *        EMAIL_PROVIDER=graph
  *        MS_TENANT_ID=... / MS_CLIENT_ID=... / MS_CLIENT_SECRET=...
- */
+ *  */
 
 require("dotenv").config();
 
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
-const ExcelJS = require("exceljs");
 const PDFDocument = require("pdfkit");
 const nodemailer = require("nodemailer");
 
@@ -177,6 +176,12 @@ const DRY_RUN = String(process.env.DRY_RUN || "").toLowerCase() === "true";
  * Filter to a single reporting manager's email for testing (e.g. TEST_MANAGER_EMAIL=kandhakt@clouddestinations.com)
  */
 const TEST_MANAGER_EMAIL = (process.env.TEST_MANAGER_EMAIL || "").trim().toLowerCase();
+
+/**
+ * CEO email: receives the organization-wide report with CEO reportees on page 1,
+ * followed by all other reporting managers (each starting on a new page).
+ */
+const CEO_EMAIL = (process.env.CEO_EMAIL || "").trim().toLowerCase();
 
 /**
  * RATE LIMITING — adaptive, not pre-emptive.
@@ -388,7 +393,7 @@ async function getAccessToken(clientId, clientSecret, refreshToken) {
   if (error || !access_token) {
     throw new Error(
       `OAuth token exchange failed for client_id=${clientId}: ${error || "no access_token returned"}. ` +
-        `The refresh token may have expired — regenerate it at https://api-console.zoho.in`
+      `The refresh token may have expired — regenerate it at https://api-console.zoho.in`
     );
   }
   return access_token;
@@ -510,7 +515,7 @@ async function fetchEmployees(token) {
   if (shortIds.length) {
     console.warn(
       `  [WARN] ${shortIds.length} very short EmployeeID(s): ${shortIds.join(", ")}. ` +
-        `Matched on token boundaries so they cannot collide, but verify they are real.`
+      `Matched on token boundaries so they cannot collide, but verify they are real.`
     );
   }
 
@@ -529,6 +534,7 @@ async function fetchEmployees(token) {
       empId: f["EmployeeID"],
       name: [f["FirstName"], f["LastName"]].filter(Boolean).join(" "),
       email: f["EmailID"],
+      department: departmentOf(f),
       managerId,
       managerName: (managerId ? mgrRaw.replace(managerId, "") : mgrRaw).trim(),
       managerEmail: f["Reporting_To.MailID"] || null,
@@ -541,6 +547,25 @@ async function fetchEmployees(token) {
       isActive: isActiveStatus(statusOf(f)),
     };
   });
+}
+
+const DEPARTMENT_FIELDS = ["Department", "Department_Name", "Department.Department_Name", "Department_name", "department"];
+
+function departmentOf(fields) {
+  for (const k of DEPARTMENT_FIELDS) {
+    if (fields[k]) {
+      const val = fields[k];
+      if (typeof val === "object") return val.name || val.Department_Name || "-";
+      return String(val).trim() || "-";
+    }
+  }
+  const key = Object.keys(fields).find((k) => /^department$/i.test(k) || /department_name/i.test(k));
+  if (key && fields[key]) {
+    const val = fields[key];
+    if (typeof val === "object") return val.name || val.Department_Name || "-";
+    return String(val).trim() || "-";
+  }
+  return "-";
 }
 
 function isActiveStatus(status) {
@@ -615,7 +640,7 @@ async function detectZohoTimezone(token, employees, dateStr) {
   }
   throw new Error(
     "Could not read responseTimezone from any probe employee. " +
-      "Set ZOHO_TIMEZONE_OVERRIDE in .env (e.g. America/Los_Angeles) to proceed."
+    "Set ZOHO_TIMEZONE_OVERRIDE in .env (e.g. America/Los_Angeles) to proceed."
   );
 }
 
@@ -881,6 +906,7 @@ function buildRow(emp, punches, dayStart, dayEnd, status, site) {
   return {
     empId: emp.empId,
     name: emp.name,
+    department: emp.department || "-",
     workingHours: hhmm(calc.workedMinutes),
     workedMinutes: calc.workedMinutes,
     breakTime: hhmm(calc.breakMinutes),
@@ -962,65 +988,6 @@ function groupByManager(employees, rows) {
   return grouped;
 }
 
-// ==================================================================
-// EXCEL
-// ==================================================================
-
-async function buildExcel(managerName, rows, dateStr, outDir) {
-  const wb = new ExcelJS.Workbook();
-  const sheet = wb.addWorksheet("Working Hours");
-
-  sheet.columns = [
-    { header: "Employee ID", key: "empId", width: 20 },
-    { header: "Name", key: "name", width: 30 },
-    { header: "Working Hours", key: "workingHours", width: 16 },
-    { header: "Break Time", key: "breakTime", width: 13 },
-    { header: "Sessions", key: "sessions", width: 10 },
-    { header: "Site", key: "site", width: 18 },
-    { header: "Note", key: "note", width: 36 },
-  ];
-
-  sheet.getRow(1).eachCell((c) => {
-    c.font = { bold: true, color: { argb: "FFFFFFFF" } };
-    c.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF2E7D32" } };
-    c.alignment = { horizontal: "center" };
-  });
-
-  rows.forEach((row) => {
-    const r = sheet.addRow(row);
-    r.getCell("workingHours").alignment = { horizontal: "center" };
-    r.getCell("workingHours").font = { bold: true };
-    if (row.unreliable) {
-      r.eachCell((c) => {
-        c.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFF3CD" } };
-      });
-      r.getCell("note").font = { color: { argb: "FF9C6500" }, bold: true };
-    }
-  });
-
-  sheet.views = [{ state: "frozen", ySplit: 1 }];
-  sheet.autoFilter = { from: "A1", to: "G1" };
-
-  const total = rows.reduce((s, r) => s + r.workedMinutes, 0);
-  sheet.addRow([]);
-  const tr = sheet.addRow({ name: "TEAM TOTAL", workingHours: hhmm(total) });
-  tr.font = { bold: true };
-  tr.getCell("workingHours").alignment = { horizontal: "center" };
-
-  sheet.addRow([]);
-  const note = sheet.addRow([
-    "Working Hours = the sum of all paired check-in/check-out sessions, i.e. time on premises. " +
-      "Restroom and gym gate scans are excluded. Meals taken in the on-site cafeteria are not badged " +
-      "and so count as working time; Break Time reflects only periods where the employee badged out of " +
-      "the building. Times are IST. Amber rows need verification.",
-  ]);
-  note.font = { italic: true, size: 9, color: { argb: "FF666666" } };
-
-  const safe = String(managerName).replace(/[^\w\s-]/g, "").replace(/\s+/g, "_");
-  const fp = path.join(outDir, `working_hours_${safe}_${dateStr}.xlsx`);
-  await wb.xlsx.writeFile(fp);
-  return fp;
-}
 
 // ==================================================================
 // PDF
@@ -1028,10 +995,11 @@ async function buildExcel(managerName, rows, dateStr, outDir) {
 
 const COLS = [
   { header: "Emp ID", key: "empId", width: 90 },
-  { header: "Name", key: "name", width: 165 },
+  { header: "Name", key: "name", width: 120 },
+  { header: "Department", key: "department", width: 85 },
   { header: "Working Hours", key: "workingHours", width: 75, align: "center" },
-  { header: "Breaks", key: "breakTime", width: 55, align: "center" },
-  { header: "Note", key: "note", width: 130 },
+  { header: "Breaks", key: "breakTime", width: 45, align: "center" },
+  { header: "Note", key: "note", width: 100 },
 ];
 const TABLE_W = COLS.reduce((a, c) => a + c.width, 0); // 515pt = A4 minus 40pt margins
 
@@ -1081,8 +1049,8 @@ function buildPdf(managerName, rows, dateStr, outDir) {
         y = pdfHeader(doc, 40);
         doc.fontSize(8.5);
       }
-      // Two-line row height so long names wrap rather than truncate.
-      const nameLines = String(row.name).length > 26 ? 2 : 1;
+      // Two-line row height so long names or departments wrap rather than truncate.
+      const nameLines = String(row.name).length > 20 || String(row.department).length > 16 ? 2 : 1;
       const h = nameLines === 2 ? 26 : 19;
 
       doc.rect(40, y, TABLE_W, h).fill(row.unreliable ? "#FFF3CD" : i % 2 === 0 ? "#FFFFFF" : "#F5F5F5");
@@ -1097,7 +1065,7 @@ function buildPdf(managerName, rows, dateStr, outDir) {
           .text(String(row[c.key] ?? "-"), x + 5, y + 5, {
             width: c.width - 10,
             align: c.align || "left",
-            lineBreak: c.key === "name",
+            lineBreak: c.key === "name" || c.key === "department",
             ellipsis: true,
             height: h - 6,
           });
@@ -1110,8 +1078,8 @@ function buildPdf(managerName, rows, dateStr, outDir) {
     const total = rows.reduce((s, r) => s + r.workedMinutes, 0);
     doc.rect(40, y, TABLE_W, 20).fill("#E8F5E9");
     doc.fillColor("#000").font("Helvetica-Bold").fontSize(9);
-    doc.text("TEAM TOTAL", 45, y + 6, { width: 250, lineBreak: false });
-    doc.text(hhmm(total), 295, y + 6, { width: 75, align: "center", lineBreak: false });
+    doc.text("TEAM TOTAL", 45, y + 6, { width: 285, lineBreak: false });
+    doc.text(hhmm(total), 335, y + 6, { width: 75, align: "center", lineBreak: false });
     doc.font("Helvetica");
     y += 20;
 
@@ -1127,6 +1095,118 @@ function buildPdf(managerName, rows, dateStr, outDir) {
           { width: TABLE_W }
         );
     }
+
+    doc.end();
+    stream.on("finish", () => resolve(fp));
+    stream.on("error", reject);
+  });
+}
+
+/**
+ * Builds the company-wide PDF for the CEO:
+ * - CEO direct reportees appear on Page 1
+ * - All other reporting managers follow, each starting on a new page
+ */
+function buildCeoPdf(ceoName, grouped, dateStr, outDir, ceoEmail) {
+  return new Promise((resolve, reject) => {
+    const safe = String(ceoName || "CEO").replace(/[^\w\s-]/g, "").replace(/\s+/g, "_");
+    const fp = path.join(outDir, `working_hours_COMPANY_WIDE_${safe}_${dateStr}.pdf`);
+    const doc = new PDFDocument({ margin: 40, size: "A4" });
+    const stream = fs.createWriteStream(fp);
+    doc.pipe(stream);
+
+    const ceoNormalized = (ceoEmail || "").toLowerCase();
+    const ceoEntry = ceoNormalized ? grouped.get(ceoNormalized) : null;
+    const otherManagers = [...grouped.entries()]
+      .filter(([email]) => !ceoNormalized || email.toLowerCase() !== ceoNormalized)
+      .sort((a, b) => String(a[1].managerName).localeCompare(String(b[1].managerName)));
+
+    const orderedGroups = [];
+    if (ceoEntry && ceoEntry.rows.length > 0) {
+      orderedGroups.push({
+        email: ceoNormalized,
+        managerName: ceoEntry.managerName || ceoName || "CEO",
+        rows: ceoEntry.rows,
+        isCeo: true,
+      });
+    }
+    for (const [email, g] of otherManagers) {
+      orderedGroups.push({
+        email,
+        managerName: g.managerName,
+        rows: g.rows,
+        isCeo: false,
+      });
+    }
+
+    orderedGroups.forEach((group, gIdx) => {
+      if (gIdx > 0) {
+        doc.addPage();
+      }
+
+      const titleSuffix = group.isCeo ? " (CEO - Direct Reportees)" : "";
+      doc.fontSize(16).fillColor("#000").text(`Daily Working Hours — ${dateStr}`);
+      doc.fontSize(11).fillColor("#444").text(`Reporting Manager: ${group.managerName}${titleSuffix}`);
+      doc.moveDown(0.8);
+
+      let y = pdfHeader(doc, doc.y);
+      doc.fontSize(8.5);
+
+      group.rows.forEach((row, i) => {
+        if (y > 750) {
+          doc.addPage();
+          doc.fontSize(10).fillColor("#444").text(`Reporting Manager: ${group.managerName}${titleSuffix} (cont.)`);
+          doc.moveDown(0.5);
+          y = pdfHeader(doc, doc.y);
+          doc.fontSize(8.5);
+        }
+
+        const nameLines = String(row.name).length > 20 || String(row.department).length > 16 ? 2 : 1;
+        const h = nameLines === 2 ? 26 : 19;
+
+        doc.rect(40, y, TABLE_W, h).fill(row.unreliable ? "#FFF3CD" : i % 2 === 0 ? "#FFFFFF" : "#F5F5F5");
+
+        let x = 40;
+        for (const c of COLS) {
+          const isHours = c.key === "workingHours";
+          doc
+            .fillColor(c.key === "note" && row.unreliable ? "#9C6500" : "#000")
+            .font(isHours ? "Helvetica-Bold" : "Helvetica")
+            .fontSize(isHours ? 9.5 : 8.5)
+            .text(String(row[c.key] ?? "-"), x + 5, y + 5, {
+              width: c.width - 10,
+              align: c.align || "left",
+              lineBreak: c.key === "name" || c.key === "department",
+              ellipsis: true,
+              height: h - 6,
+            });
+          x += c.width;
+        }
+        doc.font("Helvetica").fontSize(8.5);
+        y += h;
+      });
+
+      const total = group.rows.reduce((s, r) => s + r.workedMinutes, 0);
+      doc.rect(40, y, TABLE_W, 20).fill("#E8F5E9");
+      doc.fillColor("#000").font("Helvetica-Bold").fontSize(9);
+      doc.text("TEAM TOTAL", 45, y + 6, { width: 285, lineBreak: false });
+      doc.text(hhmm(total), 335, y + 6, { width: 75, align: "center", lineBreak: false });
+      doc.font("Helvetica");
+      y += 20;
+
+      const bad = group.rows.filter((r) => r.unreliable).length;
+      if (bad) {
+        doc
+          .fontSize(8)
+          .fillColor("#9C6500")
+          .text(
+            `${bad} highlighted row(s) need verification — see the Note column.`,
+            40,
+            y + 8,
+            { width: TABLE_W }
+          );
+      }
+    });
 
     doc.end();
     stream.on("finish", () => resolve(fp));
@@ -1231,9 +1311,9 @@ async function getGraphToken() {
     const d = err.response?.data;
     throw new Error(
       `Microsoft token request failed: ${d?.error || err.message}` +
-        (d?.error_description ? `\n  ${String(d.error_description).split("\n")[0]}` : "") +
-        `\n  Check MS_TENANT_ID, MS_CLIENT_ID and MS_CLIENT_SECRET. A secret that has expired ` +
-        `is the most common cause — they have a maximum lifetime of 24 months.`
+      (d?.error_description ? `\n  ${String(d.error_description).split("\n")[0]}` : "") +
+      `\n  Check MS_TENANT_ID, MS_CLIENT_ID and MS_CLIENT_SECRET. A secret that has expired ` +
+      `is the most common cause — they have a maximum lifetime of 24 months.`
     );
   }
 }
@@ -1286,8 +1366,8 @@ async function sendViaGraph(toEmail, subject, text, html, files) {
     if (err.response?.status === 403) {
       throw new Error(
         `Graph refused the send (403 ${d?.code || ""}). Usual causes: the Mail.Send ` +
-          `APPLICATION permission was never granted admin consent, or an Application ` +
-          `Access Policy excludes ${MAIL_FROM}.` + (d?.message ? `\n  ${d.message}` : "")
+        `APPLICATION permission was never granted admin consent, or an Application ` +
+        `Access Policy excludes ${MAIL_FROM}.` + (d?.message ? `\n  ${d.message}` : "")
       );
     }
     throw new Error(`Graph sendMail failed (${err.response?.status || err.code}): ${d?.message || err.message}`);
@@ -1350,9 +1430,9 @@ async function sendViaSmtp(toEmail, subject, text, html, files) {
     if (isSesRejection(err)) {
       throw new Error(
         `SES rejected this send: ${err.response || err.message}\n` +
-          `  Either "${MAIL_FROM}" is not a verified identity in SES (region ${SMTP_HOST.split(".")[1] || "?"}), ` +
-          `or the account is still in sandbox mode and "${toEmail}" is not a pre-verified recipient. ` +
-          `Check AWS Console -> SES -> Verified identities, and the Account dashboard for sandbox status.`
+        `  Either "${MAIL_FROM}" is not a verified identity in SES (region ${SMTP_HOST.split(".")[1] || "?"}), ` +
+        `or the account is still in sandbox mode and "${toEmail}" is not a pre-verified recipient. ` +
+        `Check AWS Console -> SES -> Verified identities, and the Account dashboard for sandbox status.`
       );
     }
     throw err;
@@ -1373,38 +1453,46 @@ async function verifyMailConnection() {
   if (EMAIL_PROVIDER === "smtp" && /office365|outlook/i.test(SMTP_HOST)) {
     console.warn(
       "[NOTE] SMTP AUTH Basic Authentication is disabled by default for existing\n" +
-        "       Exchange Online tenants from the end of December 2026. Move to\n" +
-        "       EMAIL_PROVIDER=graph before then."
+      "       Exchange Online tenants from the end of December 2026. Move to\n" +
+      "       EMAIL_PROVIDER=graph before then."
     );
   }
 
   if (EMAIL_PROVIDER === "smtp" && /email-smtp\..*\.amazonaws\.com/i.test(SMTP_HOST)) {
     console.warn(
       "[NOTE] Sending via Amazon SES. This verify() step only confirms the SMTP\n" +
-        "       credentials are valid — it does NOT confirm the account can reach\n" +
-        "       real recipients. Two things to check in the AWS Console before a\n" +
-        `       live run: (1) "${MAIL_FROM}" is a verified identity in SES, and\n` +
-        "       (2) the account has PRODUCTION ACCESS, not sandbox — sandboxed\n" +
-        "       accounts can only send to pre-verified recipient addresses and cap\n" +
-        "       out at 200 messages/24h. A single test send to your own address\n" +
-        "       is the fastest way to confirm both before emailing every manager."
+      "       credentials are valid — it does NOT confirm the account can reach\n" +
+      "       real recipients. Two things to check in the AWS Console before a\n" +
+      `       live run: (1) "${MAIL_FROM}" is a verified identity in SES, and\n` +
+      "       (2) the account has PRODUCTION ACCESS, not sandbox — sandboxed\n" +
+      "       accounts can only send to pre-verified recipient addresses and cap\n" +
+      "       out at 200 messages/24h. A single test send to your own address\n" +
+      "       is the fastest way to confirm both before emailing every manager."
     );
   }
 }
 
-async function sendEmail(toEmail, managerName, dateStr, pdf, rows) {
+async function sendEmail(toEmail, managerName, dateStr, pdf, rows, isCeo = false) {
   const total = hhmm(rows.reduce((s, r) => s + r.workedMinutes, 0));
   const absent = rows.filter((r) => r.workedMinutes === 0).length;
 
-  const subject = `Daily Working Hours — ${dateStr}`;
-  const text =
-    `Hi ${managerName},\n\n` +
-    `Attached are the working hours for your team for ${dateStr}.\n\n` +
-    `Team size: ${rows.length}  |  No hours recorded: ${absent}  |  Team total: ${total}`;
-  const html =
-    `<p>Hi <strong>${managerName}</strong>,</p>` +
-    `<p>Attached are the working hours for your team for <strong>${dateStr}</strong>.</p>` +
-    `<p>Team size: ${rows.length} &nbsp;|&nbsp; No hours recorded: ${absent} &nbsp;|&nbsp; Team total: <strong>${total}</strong></p>`;
+  const subject = isCeo
+    ? `Company-Wide Daily Working Hours — ${dateStr}`
+    : `Daily Working Hours — ${dateStr}`;
+  const text = isCeo
+    ? `Hi ${managerName},\n\n` +
+      `Attached is the company-wide daily working hours report for ${dateStr}, grouped by reporting managers.\n\n` +
+      `Total staff: ${rows.length}  |  No hours recorded: ${absent}  |  Company total: ${total}`
+    : `Hi ${managerName},\n\n` +
+      `Attached are the working hours for your team for ${dateStr}.\n\n` +
+      `Team size: ${rows.length}  |  No hours recorded: ${absent}  |  Team total: ${total}`;
+  const html = isCeo
+    ? `<p>Hi <strong>${managerName}</strong>,</p>` +
+      `<p>Attached is the company-wide daily working hours report for <strong>${dateStr}</strong>, grouped by reporting managers.</p>` +
+      `<p>Total staff: ${rows.length} &nbsp;|&nbsp; No hours recorded: ${absent} &nbsp;|&nbsp; Company total: <strong>${total}</strong></p>`
+    : `<p>Hi <strong>${managerName}</strong>,</p>` +
+      `<p>Attached are the working hours for your team for <strong>${dateStr}</strong>.</p>` +
+      `<p>Team size: ${rows.length} &nbsp;|&nbsp; No hours recorded: ${absent} &nbsp;|&nbsp; Team total: <strong>${total}</strong></p>`;
 
   const files = [pdf];
   return EMAIL_PROVIDER === "graph"
@@ -1428,8 +1516,8 @@ function validateConfig() {
     ...(EMAIL_PROVIDER === "graph"
       ? { MS_TENANT_ID, MS_CLIENT_ID, MS_CLIENT_SECRET }
       : EMAIL_PROVIDER === "gmail"
-      ? { GMAIL_APP_PASSWORD: process.env.GMAIL_APP_PASSWORD }
-      : { SMTP_USER, SMTP_PASSWORD }),
+        ? { GMAIL_APP_PASSWORD: process.env.GMAIL_APP_PASSWORD }
+        : { SMTP_USER, SMTP_PASSWORD }),
   })
     .filter(([, v]) => !v)
     .map(([k]) => k);
@@ -1476,14 +1564,14 @@ async function main() {
   if (danglingManagers.size) {
     console.warn(
       `[WARN] ${danglingManagers.size} manager ID(s) referenced but not present in the employee list, e.g. ` +
-        `${[...danglingManagers].slice(0, 3).join(", ")}.\n` +
-        `       The employee fetch may be incomplete. Those reportees fall back to Reporting_To.MailID.`
+      `${[...danglingManagers].slice(0, 3).join(", ")}.\n` +
+      `       The employee fetch may be incomplete. Those reportees fall back to Reporting_To.MailID.`
     );
   }
   if (employees.length % EMPLOYEE_PAGE_SIZE === 0 && employees.length > 0) {
     console.warn(
       `[WARN] Employee count is an exact multiple of the ${EMPLOYEE_PAGE_SIZE}-record page size. ` +
-        `Verify no page was missed.`
+      `Verify no page was missed.`
     );
   }
 
@@ -1499,7 +1587,7 @@ async function main() {
   if (inactiveCount) {
     console.log(
       `Excluding ${inactiveCount} former employee(s) [${EXCLUDE_EMPLOYEE_STATUS.join(", ")}] — ` +
-        `${activeStaff.length} active. Saves roughly ${inactiveCount * 2} API calls.`
+      `${activeStaff.length} active. Saves roughly ${inactiveCount * 2} API calls.`
     );
   }
   const withIds = activeStaff;
@@ -1584,7 +1672,7 @@ async function main() {
   if (lostAll) {
     console.warn(
       `[WARN] ${lostAll} employee(s) had ONLY scan-only-gate punches. Raw stream kept for them.\n` +
-        `       Check the census — a real entry gate may have been misclassified.`
+      `       Check the census — a real entry gate may have been misclassified.`
     );
   }
   const bugRows = rows.filter((r) => r.note.includes("bug")).length;
@@ -1598,15 +1686,15 @@ async function main() {
   if (stillIn > 0) {
     console.warn(
       `\n[WARN] ${stillIn} employee(s) are still clocked in for ${dateStr}.\n` +
-        `       Their hours are partial. The report is running too early — schedule\n` +
-        `       it later in the morning so every session has closed.\n`
+      `       Their hours are partial. The report is running too early — schedule\n` +
+      `       it later in the morning so every session has closed.\n`
     );
   }
   if (unreliable / Math.max(1, rows.length) > 0.3) {
     console.warn(
       `[WARN] Over 30% of records still look unreliable after gate filtering.\n` +
-        `       Check the badge location census above — if the entry gate was\n` +
-        `       misclassified, set ENTRY_LOCATIONS explicitly in .env.\n`
+      `       Check the badge location census above — if the entry gate was\n` +
+      `       misclassified, set ENTRY_LOCATIONS explicitly in .env.\n`
     );
   }
 
@@ -1654,6 +1742,8 @@ async function main() {
     console.log(`[TEST FILTER] TEST_MANAGER_EMAIL is set. Only processing manager: ${TEST_MANAGER_EMAIL}\n`);
   }
 
+  let ceoProcessed = false;
+
   for (const [mgrEmail, g] of grouped.entries()) {
     const mgrName = g.managerName || mgrEmail;
     if (!g.rows.length) continue;
@@ -1680,18 +1770,24 @@ async function main() {
       continue;
     }
 
-    try {
+    const isCeo = CEO_EMAIL && mgrEmail.toLowerCase() === CEO_EMAIL;
+    if (isCeo) ceoProcessed = true;
 
-      const pdf = await buildPdf(mgrName, g.rows, dateStr, outDir);
+    try {
+      const pdf = isCeo
+        ? await buildCeoPdf(mgrName, grouped, dateStr, outDir, CEO_EMAIL)
+        : await buildPdf(mgrName, g.rows, dateStr, outDir);
+
       if (DRY_RUN) {
-        console.log(`  [dry] ${mgrName} (${mgrEmail}) — ${g.rows.length} reportee(s), files built`);
+        console.log(`  [dry] ${mgrName} (${mgrEmail}) — ${isCeo ? "COMPANY-WIDE (CEO REPORT)" : `${g.rows.length} reportee(s)`}, files built`);
         continue;
       }
       if (sesPaceMs && sent > 0) await sleep(sesPaceMs);
-      const id = await sendEmail(mgrEmail, mgrName, dateStr, pdf, g.rows);
+      const emailRows = isCeo ? rows : g.rows;
+      const id = await sendEmail(mgrEmail, mgrName, dateStr, pdf, emailRows, isCeo);
       sent++;
       consecutiveSesRejections = 0;
-      console.log(`  sent -> ${mgrEmail} (${g.rows.length} reportees) [${id}]`);
+      console.log(`  sent -> ${mgrEmail} (${isCeo ? "all staff [CEO report]" : `${g.rows.length} reportees`}) [${id}]`);
     } catch (err) {
       // One manager failing must not abort the rest of the run.
       failed++;
@@ -1703,14 +1799,34 @@ async function main() {
           sesCircuitTripped = true;
           console.error(
             `\n[STOPPED] ${consecutiveSesRejections} consecutive SES rejections — this account is almost\n` +
-              `          certainly in SANDBOX MODE, which only permits sending to pre-verified\n` +
-              `          recipient addresses. Remaining managers will be listed as held rather\n` +
-              `          than retried individually. Request production access in the AWS SES\n` +
-              `          console (Account dashboard -> Request production access), or verify\n` +
-              `          each recipient address individually for a small pilot group.\n`
+            `          certainly in SANDBOX MODE, which only permits sending to pre-verified\n` +
+            `          recipient addresses. Remaining managers will be listed as held rather\n` +
+            `          than retried individually. Request production access in the AWS SES\n` +
+            `          console (Account dashboard -> Request production access), or verify\n` +
+            `          each recipient address individually for a small pilot group.\n`
           );
         }
       }
+    }
+  }
+
+  // If CEO_EMAIL is set and wasn't among the managers with reportees, send to CEO now
+  if (CEO_EMAIL && !ceoProcessed && (!TEST_MANAGER_EMAIL || TEST_MANAGER_EMAIL === CEO_EMAIL)) {
+    const ceoEmp = employees.find((e) => e.email && e.email.toLowerCase() === CEO_EMAIL);
+    const ceoName = ceoEmp ? ceoEmp.name : "CEO";
+    try {
+      const pdf = await buildCeoPdf(ceoName, grouped, dateStr, outDir, CEO_EMAIL);
+      if (DRY_RUN) {
+        console.log(`  [dry] ${ceoName} (${CEO_EMAIL}) — COMPANY-WIDE (CEO REPORT), files built`);
+      } else {
+        if (sesPaceMs && sent > 0) await sleep(sesPaceMs);
+        const id = await sendEmail(CEO_EMAIL, ceoName, dateStr, pdf, rows, true);
+        sent++;
+        console.log(`  sent -> ${CEO_EMAIL} (all staff [CEO report]) [${id}]`);
+      }
+    } catch (err) {
+      failed++;
+      console.error(`  [FAILED] CEO ${ceoName} (${CEO_EMAIL}): ${err.message}`);
     }
   }
 
@@ -1747,6 +1863,8 @@ module.exports = {
   formatIst,
   hhmm,
   zoneOffsetMinutes,
+  buildPdf,
+  buildCeoPdf,
 };
 
 // ==================================================================
